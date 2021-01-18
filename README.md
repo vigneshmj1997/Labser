@@ -1,5 +1,5 @@
 
-Lbser is a library to calculate and use multilingual sentence embeddings.
+Labser is a library to calculate and use multilingual sentence embeddings.
 
 ## Dependencies
 * Python 3.6
