@@ -18,5 +18,4 @@ Labser is a library to calculate and use multilingual sentence embeddings.
   `export LASER="${HOME}/projects/laser"`
 * download encoders from Amazon s3 by `bash ./install_models.sh`
 * download third party software by `bash ./install_external_tools.sh`
-* download the data used in the example tasks (see description for each task)
 
