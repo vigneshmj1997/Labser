@@ -43,6 +43,7 @@ from text_processing import Token, BPEfastApply
 
 
 def TextLoadUnify(fname, seek, args, start, stop):
+    print(start, ",", stop)
     if args.verbose:
         print(" - loading texts {:s}: ".format(fname), end="")
     fin = open(fname, encoding=args.encoding, errors="surrogateescape")
@@ -83,8 +84,12 @@ def TextLoadUnify(fname, seek, args, start, stop):
 ###############################################################################
 
 
-def knn(x, y, k, use_gpu):
-    return knnGPU(x, y, k) if use_gpu else knnCPU(x, y, k)
+def knn(x, y, k, use_gpu, dim, name, index_factory):
+    return (
+        knnGPU(x, y, k, dim, index_name=name, index_factory=index_factory)
+        if use_gpu
+        else knnCPU(x, y, k)
+    )
 
     ###############################################################################
     #
@@ -93,19 +98,35 @@ def knn(x, y, k, use_gpu):
     ###############################################################################
 
 
-def knnGPU(x, y, k, mem=5 * 1024 * 1024 * 1024):
+def knnGPU(
+    x, y, k, dim, index_name="index", index_factory="Flat", mem=5 * 1024 * 1024 * 1024
+):
     x = x.astype("float32")
     y = y.astype("float32")
-    print(x.shape)
-    print(y.shape)
-    d = x.shape[1]
-    index = faiss.IndexFlatL2(d)  # this remains the same
-    index = faiss.IndexIVFPQ(index, d, 100, 8, 8)
-    index = faiss.index_cpu_to_all_gpus(index)
-    index.train(y)
-    index.add(y)
-    index.nprobe = 20
-    sim, ind = index.search(x, k)
+    d = y.shape[1]
+    # index2 = faiss.index_factory(dim, index_factory)
+    # index2 = faiss.index_cpu_to_all_gpus(index2)
+
+    index2 = faiss.IndexFlatL2(d)  # this remains the same
+    index2 = faiss.IndexIVFPQ(index2, d, 32768, 8, 8)
+    index2 = faiss.index_cpu_to_all_gpus(index2)
+
+    name = "./" + index_factory + "/" + index_name
+    if not os.path.exists(name):
+        if not os.path.exists("./" + index_factory):
+            os.mkdir("./" + index_factory)
+        index2.train(y)
+        temp = faiss.index_gpu_to_cpu(index2)
+        faiss.write_index(temp, name)
+        print("Index {name} got saved".format(name="index_name"))
+
+    else:
+        index2 = faiss.read_index(name)
+        index2 = faiss.index_cpu_to_all_gpus(index2)
+    index2.add(y)
+    index2.nprobe = 10
+    sim, ind = index2.search(x, k)
+
     return sim, ind
 
 
@@ -163,8 +184,8 @@ def mine_text(
     trg_inds, trg_sents, trg_file_pos = TextLoadUnify(
         args.trg, trg_file_pos, args, trg_start, trg_stop
     )
-    print(len(src_inds), "len of src sentence")
-    print(len(trg_inds), "len of trg sentence")
+    # print(len(src_inds), "len of src sentence")
+    # print(len(trg_inds), "len of trg sentence")
 
     def unique_embeddings(emb, ind, verbose=False):
         aux = {j: i for i, j in enumerate(ind)}
@@ -173,6 +194,7 @@ def mine_text(
         return emb[[aux[i] for i in range(len(aux))]]
 
     # load Embeddings
+    # load x
     x = EmbedLoad(
         args.src_embeddings,
         src_start,
@@ -181,11 +203,12 @@ def mine_text(
         verbose=args.verbose,
         dtype=args.dtype,
     )
-    # print(sys.getsizeof(x)/1024**3,"size of x")
     if args.unify:
         x = unique_embeddings(x, src_inds, args.verbose)
     if args.encoder == "laser":
         faiss.normalize_L2(x)
+
+    # load y
     y = EmbedLoad(
         args.trg_embeddings,
         trg_start,
@@ -194,36 +217,43 @@ def mine_text(
         verbose=args.verbose,
         dtype=args.dtype,
     )
-    # print(sys.getsizeof(y)/1024**3,"size of y")
 
     if args.unify:
         y = unique_embeddings(y, trg_inds, args.verbose)
     if args.encoder == "laser":
         faiss.normalize_L2(y)
 
-    print(x.shape, "x_shape")
-    print(y.shape, "y_shape")
-    print(args.gpu)
     if args.retrieval is not "bwd":
-        print("bwd")
         if args.verbose:
             print(" - perform {:d}-nn source against target".format(args.neighborhood))
-        x2y_sim, x2y_ind = knn(x, y, min(y.shape[0], args.neighborhood), args.gpu)
+        name = "bwd" + str(trg_start) + "-" + str(trg_stop)
+        x2y_sim, x2y_ind = knn(
+            x,
+            y,
+            min(y.shape[0], args.neighborhood),
+            args.gpu,
+            args.dim,
+            name,
+            args.index_factory,
+        )
         x2y_mean = x2y_sim.mean(axis=1)
 
     if args.retrieval is not "fwd":
-        print("fwd")
         if args.verbose:
             print(" - perform {:d}-nn target against source".format(args.neighborhood))
-        y2x_sim, y2x_ind = knn(y, x, min(x.shape[0], args.neighborhood), args.gpu)
+        name = "fwd" + str(src_start) + "-" + str(src_stop)
+        y2x_sim, y2x_ind = knn(
+            y,
+            x,
+            min(x.shape[0], args.neighborhood),
+            args.gpu,
+            args.dim,
+            name,
+            args.index_factory,
+        )
         y2x_mean = y2x_sim.mean(axis=1)
 
-    if args.margin == "absolute":
-        margin = lambda a, b: a
-    elif args.margin == "distance":
-        margin = lambda a, b: a - b
-    else:  # args.margin == 'ratio':
-        margin = lambda a, b: a / b
+    margin = lambda a, b: a / b
     name = (
         str(args.output)
         + str(src_start)
@@ -240,7 +270,8 @@ def mine_text(
             print(" - mining for parallel data")
         fwd_scores = None
         fwd_scores = None
-        if args.encoder == "laser" or args.cosine_sim:
+        if args.cosine_sim:
+            print("cosine sim")
             fwd_scores = score_candidates(
                 x, y, x2y_ind, x2y_mean, y2x_mean, margin, args.verbose
             )
@@ -248,14 +279,11 @@ def mine_text(
                 y, x, y2x_ind, y2x_mean, x2y_mean, margin, args.verbose
             )
         elif args.encoder == "labse":
+            print("labse")
             fwd_scores = x2y_sim
             bwd_scores = y2x_sim
-        if args.encoder == "laser":
-            fwd_best = x2y_ind[np.arange(x.shape[0]), fwd_scores.argmax(axis=1)]
-            bwd_best = y2x_ind[np.arange(y.shape[0]), bwd_scores.argmax(axis=1)]
-        if args.encoder == "labse":
-            fwd_best = x2y_ind[np.arange(x.shape[0]), fwd_scores.argmin(axis=1)]
-            bwd_best = y2x_ind[np.arange(y.shape[0]), bwd_scores.argmin(axis=1)]
+        fwd_best = x2y_ind[np.arange(x.shape[0]), fwd_scores.argmax(axis=1)]
+        bwd_best = y2x_ind[np.arange(y.shape[0]), bwd_scores.argmax(axis=1)]
 
         if args.verbose:
             print(" - writing alignments to {:s}".format(args.output))
@@ -309,7 +337,6 @@ def mine_text(
                         count += 1
 
     fout.close()
-    print(count)
     return src_file_pos, trg_file_pos, count
 
 
@@ -352,6 +379,12 @@ if __name__ == "__main__":
         "-k", "--neighborhood", type=int, default=4, help="Neighborhood size"
     )
     parser.add_argument(
+        "--index-factory",
+        type=str,
+        default="IVF6384_HNSW32",
+        help="Faiss Index factory string",
+    )
+    parser.add_argument(
         "--margin",
         choices=["absolute", "distance", "ratio"],
         default="ratio",
@@ -389,17 +422,12 @@ if __name__ == "__main__":
         help="size of data to be loaded at a time",
     )
     parser.add_argument(
-        "--num-lines-src",
-        type=int,
-        required=True,
-        help="size of data to be loaded at a time",
+        "--src_lines", nargs="+",type=int, help="start,stop lines for source file"
     )
     parser.add_argument(
-        "--num-lines-trg",
-        type=int,
-        required=True,
-        help="size of data to be loaded at a time",
+        "--trg_lines", nargs="+",type=int, help="start,stop lines for target file"
     )
+
     args = parser.parse_args()
 
     print("LASER: tool to search, score or mine bitexts")
@@ -407,11 +435,24 @@ if __name__ == "__main__":
         print(" - knn will run on all available GPUs (recommended)")
     else:
         print(" - knn will run on CPU (slow)")
-    size_src = int(os.stat(args.src_embeddings).st_size / (args.dim * 2))
-    size_trg = int(os.stat(args.trg_embeddings).st_size / (args.dim * 2))
-    print(size_src)
-    print(size_trg)
-    print("$$$$$$$$$$$$$$$$")
+
+    if args.dtype == "fp16":
+        denomenator = 2
+    elif args.dtype == "fp32":
+        denomenator = 4
+    src_start = 0
+    trg_start = 0
+    src_stop = int(os.stat(args.src_embeddings).st_size / (args.dim * denomenator))
+    trg_stop = int(os.stat(args.trg_embeddings).st_size / (args.dim * denomenator))
+
+    size_src = int(os.stat(args.src_embeddings).st_size / (args.dim * denomenator))
+    size_trg = int(os.stat(args.trg_embeddings).st_size / (args.dim * denomenator))
+
+    if args.src_lines != None:
+        src_start = args.src_lines[0]
+        trg_start = args.trg_lines[0]
+        src_stop = args.src_lines[1]
+        trg_stop = args.trg_lines[1]
     chunk_lines = min(int(size_src / args.dim), int(size_trg / args.dim))
     if args.encoder == "labse":
         chunk_lines = int(args.chunk_size * 6000000 // 16)
@@ -419,21 +460,19 @@ if __name__ == "__main__":
         chunk_lines = int(args.chunk_size * 3000000 // 24)
     src_pos = 0
     trg_pos = 0
+    # According to the US Census Bureau, by 2010, the District's population declined to 20,876 people.
     tot = 0
-    for i in tqdm(range(0, size_src, chunk_lines)):
-        for j in range(0, size_trg, chunk_lines):
+    print(chunk_lines, "chunk_lines")
+    for i in tqdm(range(src_start, src_stop, chunk_lines)):
+        for j in range(trg_start, trg_stop, chunk_lines):
 
             src_stop = min(i + chunk_lines, size_src)
             trg_stop = min(j + chunk_lines, size_trg)
-            print(i, src_stop, "range")
-            print(j, src_stop, "range")
             start = time.time()
             src_pos, trg_pos, count = mine_text(
                 i, src_stop, j, trg_stop, args, src_pos, trg_pos, tot
             )
             stop = time.time()
-            exit()
-            print("Total time is ", start - stop)
+            print("Total time is per itertation is ", start - stop)
             tot += count
     print(count)
-# def mine_text(src_start,src_stop,trt_start,trg_stop,args,src_pos,trg_pos):

@@ -378,12 +378,14 @@ def EncodeFile(
 
 
 # Load existing embeddings
-def EmbedLoad(fname, start, stop, dim=1024, verbose=False,dtype="fp32"):
+def EmbedLoad(fname, start, stop, dim=1024, verbose=False, dtype="fp32"):
     stop = (stop - start) * dim
     start = start * dim
-    dtype=np.float32
-    if(dtype=="fp16"):
-        dtype=np.float16
+    print(dim,"dimension")
+    if dtype == "fp16":
+        dtype = np.float16
+    else:
+        dtype = np.float32
     x = np.fromfile(fname, dtype=dtype, count=stop, offset=start)
     x.resize(x.shape[0] // dim, dim)
     if verbose:
@@ -398,6 +400,77 @@ def EmbedMmap(fname, dim=1024, dtype=np.float32, verbose=False):
     if verbose:
         print(" - embeddings on disk: {:s} {:d} x {:d}".format(fname, nbex, dim))
     return E
+
+
+def encoder_file(
+    half,
+    ifname,
+    output,
+    encoder_name,
+    token_lang,
+    verbose,
+    bpe_codes,
+    max_sentences=None,
+    max_tokens=12000,
+    cpu=False,
+    stable=True,
+    encode_batch_size=45000,
+    buffer_size=40000,
+):
+    encoder = None
+    pool = None
+    if encoder_name == "laser":
+        path = str(os.path.join(LASER, "models", "bilstm.93langs.2018-12-26.pt"))
+        encoder = SentenceEncoder(
+            path,
+            max_sentences=max_sentences,
+            max_tokens=max_tokens,
+            sort_kind="mergesort" if stable else "quicksort",
+            cpu=cpu,
+            fp16=half,
+        )
+    if encoder_name == "labse":
+        encoder = SentenceTransformer("LaBSE")
+        if half:
+            encoder.half()
+        encoder.eval()
+        pool = encoder.start_multi_process_pool(encode_batch_size=encode_batch_size)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ifname = ""  # stdin will be used
+        if token_lang != "--" and encoder_name == "laser":
+            tok_fname = os.path.join(tmpdir, "tok")
+            Token(
+                ifname,
+                tok_fname,
+                lang=token_lang,
+                romanize=True if token_lang == "el" else False,
+                lower_case=True,
+                gzip=False,
+                verbose=verbose,
+                over_write=False,
+            )
+
+            ifname = tok_fname
+        if bpe_codes:
+            bpe_fname = os.path.join(tmpdir, "bpe")
+            BPEfastApply(
+                ifname,
+                bpe_fname,
+                bpe_codes,
+                verbose=verbose,
+                over_write=False,
+            )
+            ifname = bpe_fname
+        EncodeFile(
+            pool,
+            encoder_name,
+            encoder,
+            ifname,
+            output,
+            verbose=verbose,
+            over_write=False,
+            buffer_size=buffer_size,
+        )
 
 
 if __name__ == "__main__":
@@ -430,7 +503,7 @@ if __name__ == "__main__":
         "--encode_batch_size", type=int, default=45000, help="batch size (sentences)"
     )
     parser.add_argument("--unify", action="store_true", help="Unify texts")
-    
+
     parser.add_argument(
         "--max-tokens",
         type=int,
@@ -450,7 +523,7 @@ if __name__ == "__main__":
         help="Use stable merge sort instead of quick sort",
     )
     parser.add_argument("--half", action="store_true", help="to use fp16")
-    
+
     args = parser.parse_args()
 
     args.buffer_size = max(args.buffer_size, 1)
@@ -470,11 +543,11 @@ if __name__ == "__main__":
             max_tokens=args.max_tokens,
             sort_kind="mergesort" if args.stable else "quicksort",
             cpu=args.cpu,
-            fp16=args.half
+            fp16=args.half,
         )
     if args.encoder == "labse":
         encoder = SentenceTransformer("LaBSE")
-        if(args.half):
+        if args.half:
             encoder.half()
         encoder.eval()
         pool = encoder.start_multi_process_pool(
