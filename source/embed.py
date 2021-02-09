@@ -32,7 +32,6 @@ from tqdm import tqdm
 from sentence_transformers import SentenceTransformer, models
 import json
 from sklearn.decomposition import PCA
-from sklearn.decomposition import IncrementalPCA
 
 
 # get environment
@@ -118,8 +117,6 @@ class SentenceEncoder:
 
         state_dict = torch.load(model_path)
         self.encoder = Encoder(**state_dict["params"])
-        print(self.encoder.parameters)
-
         self.encoder.load_state_dict(state_dict["model"])
         self.dictionary = state_dict["dictionary"]
         self.pad_index = self.dictionary["<pad>"]
@@ -326,10 +323,10 @@ def EncodeTime(t):
 #
 # Encode sentences (existing file pointers)
 def EncodeFilep(
+    encode_batch_size,
     pca_dim,
     load,
     checkpoint,
-    pool,
     encoder_name,
     encodeer,
     inp_file,
@@ -340,21 +337,60 @@ def EncodeFilep(
     n = 0
     t = time.time()
     ipca = None
+    pool = encoder.start_multi_process_pool(encode_batch_size=encode_batch_size)
+
     if pca_dim != None:
-        ipca = IncrementalPCA(n_components=pca_dim, batch_size=buffer_size)
+        pca = PCA(n_components=pca_dim)
         if verbose:
             print("Implementing pca with dim", args.pca_dim)
+        sentence, position = next(iter(buffered_read(inp_file, buffer_size, load)))
+        if encoder_name == "labse":
+            if torch.cuda.device_count() > 1:
+                temp = np.array(
+                    encoder.encode_multi_process(sentences=sentence, pool=pool)
+                )
+            else:
+                temp = np.array(encoder.encode(sentences=sentence))
+        if encoder_name == "laser":
+            temp = encoder.encode(sentence)
+        pca.fit(temp)
+        if verbose:
+            print(
+                "Total information retentivity is ", sum(pca.explained_variance_ratio_)
+            )
+        dense = models.Dense(
+            in_features=1024 if encoder_name == "laser" else 768,
+            out_features=pca_dim,
+            bias=False,
+            activation_function=torch.nn.Identity(),
+        )
+        dense.linear.weight = torch.nn.Parameter(torch.tensor(pca.components_))
+        dense.half()
+        if encoder_name == "labse":
+            encoder.add_module("dense", dense)
+
+        if encoder_name == "laser":
+            encoder.encoder.add_module("dense", dense)
+
+    pool = encoder.start_multi_process_pool(encode_batch_size=encode_batch_size)
+
     for sentences, pointer in tqdm(buffered_read(inp_file, buffer_size, load)):
         temp = None
         if encoder_name == "laser":
             temp = encoder.encode(sentences)
 
         else:
-            temp = np.array(
-                encoder.encode_multi_process(sentences=sentences, pool=pool)
-            )
+            encoder.eval()
+            temp = None
+            if torch.cuda.device_count() > 1:
+                temp = np.array(
+                    encoder.encode_multi_process(sentences=sentences, pool=pool)
+                )
+            # temp = np.array(encoder.encode(sentences=sentences))
+            else:
+                temp = np.array(encoder.encode(sentences=sentences))
+
         temp.tofile(out_file)
-        ipca.partial_fit(temp)
 
         json_filep = {"embed_position": n, "mine_position": 0}
         with open(checkpoint, "w") as json_file:
@@ -367,30 +403,14 @@ def EncodeFilep(
     if verbose:
         print("\r - Encoder: {:d} sentences".format(n), end="")
         EncodeTime(t)
-    if args.pca_dim != None:
-        pca_file = open(out_file.name + "_pca", "wb")
-        x = EmbedLoad(
-            out_file.name,
-            0,
-            -1,
-            dtype="fp16",
-            dim=768 if encoder_name == "labse" else 1024,
-        )
-        batch = x.shape[0] // 4
-        print(ipca.explained_variance_ratio_)
-        print(sum(ipca.explained_variance_ratio_))
-        for i in tqdm(range(0, x.shape[0], batch)):
-            stop = min(i + batch, x.shape[0])
-            print(x[i:stop].shape)
-            ipca.transform(x[i:stop]).astype(np.float16).tofile(pca_file)
 
 
 # Encode sentences (file names)
 def EncodeFile(
+    encode_batch_size,
     pca_dim,
     load,
     checkpoint,
-    pool,
     encoder_name,
     encoder,
     inp_fname,
@@ -412,10 +432,10 @@ def EncodeFile(
         fin = open(inp_fname, "r", encoding=inp_encoding, errors="surrogateescape")
         fout = open(out_fname, mode="wb")
         EncodeFilep(
+            encode_batch_size,
             pca_dim,
             load,
             checkpoint,
-            pool,
             encoder_name,
             encoder,
             fin,
@@ -537,11 +557,6 @@ if __name__ == "__main__":
         encoder = SentenceTransformer("LaBSE")
         if args.half:
             encoder.half()
-        encoder.eval()
-        pool = encoder.start_multi_process_pool(
-            encode_batch_size=args.encode_batch_size
-        )
-    print(encoder.parameters)
 
     with tempfile.TemporaryDirectory() as tmpdir:
         ifname = args.input  # stdin will be used
@@ -570,10 +585,10 @@ if __name__ == "__main__":
             )
             ifname = bpe_fname
         EncodeFile(
+            args.encode_batch_size,
             args.pca_dim,
             args.load,
             args.checkpoint,
-            pool,
             args.encoder,
             encoder,
             ifname,
