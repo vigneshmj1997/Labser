@@ -29,7 +29,11 @@ import torch
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, models
+import json
+from sklearn.decomposition import PCA
+from sklearn.decomposition import IncrementalPCA
+
 
 # get environment
 assert os.environ.get("LASER"), "Please set the enviornment variable LASER"
@@ -42,16 +46,24 @@ SPACE_NORMALIZER = re.compile("\s+")
 Batch = namedtuple("Batch", "srcs tokens lengths")
 
 
-def buffered_read(fp, buffer_size):
+def buffered_read(fp, buffer_size, load):
     buffer = []
+    n = 0
+    if load != None:
+        with open(load) as f:
+            data = json.load(f)
+            fp.seek(data["embed_position"])
+            n = int(data["embed_position"])
     for src_str in fp:
         buffer.append(src_str.strip())
+        n += len(src_str)
+
         if len(buffer) >= buffer_size:
-            yield buffer
+            yield buffer, n
             buffer = []
 
     if len(buffer) > 0:
-        yield buffer
+        yield buffer, n
 
 
 def buffered_arange(max):
@@ -106,6 +118,8 @@ class SentenceEncoder:
 
         state_dict = torch.load(model_path)
         self.encoder = Encoder(**state_dict["params"])
+        print(self.encoder.parameters)
+
         self.encoder.load_state_dict(state_dict["model"])
         self.dictionary = state_dict["dictionary"]
         self.pad_index = self.dictionary["<pad>"]
@@ -312,20 +326,40 @@ def EncodeTime(t):
 #
 # Encode sentences (existing file pointers)
 def EncodeFilep(
-    pool, encoder_name, encodeer, inp_file, out_file, buffer_size=40000, verbose=False
+    pca_dim,
+    load,
+    checkpoint,
+    pool,
+    encoder_name,
+    encodeer,
+    inp_file,
+    out_file,
+    buffer_size=40000,
+    verbose=False,
 ):
     n = 0
     t = time.time()
-    print("I am here")
-    for sentences in tqdm(buffered_read(inp_file, buffer_size)):
+    ipca = None
+    if pca_dim != None:
+        ipca = IncrementalPCA(n_components=pca_dim, batch_size=buffer_size)
+        if verbose:
+            print("Implementing pca with dim", args.pca_dim)
+    for sentences, pointer in tqdm(buffered_read(inp_file, buffer_size, load)):
+        temp = None
         if encoder_name == "laser":
             temp = encoder.encode(sentences)
-            temp.tofile(out_file)
+
         else:
             temp = np.array(
                 encoder.encode_multi_process(sentences=sentences, pool=pool)
             )
-            temp.tofile(out_file)
+        temp.tofile(out_file)
+        ipca.partial_fit(temp)
+
+        json_filep = {"embed_position": n, "mine_position": 0}
+        with open(checkpoint, "w") as json_file:
+            json.dump(json_filep, json_file)
+
         n += len(sentences)
         print(n)
         if verbose and n % 10000 == 0:
@@ -333,10 +367,29 @@ def EncodeFilep(
     if verbose:
         print("\r - Encoder: {:d} sentences".format(n), end="")
         EncodeTime(t)
+    if args.pca_dim != None:
+        pca_file = open(out_file.name + "_pca", "wb")
+        x = EmbedLoad(
+            out_file.name,
+            0,
+            -1,
+            dtype="fp16",
+            dim=768 if encoder_name == "labse" else 1024,
+        )
+        batch = x.shape[0] // 4
+        print(ipca.explained_variance_ratio_)
+        print(sum(ipca.explained_variance_ratio_))
+        for i in tqdm(range(0, x.shape[0], batch)):
+            stop = min(i + batch, x.shape[0])
+            print(x[i:stop].shape)
+            ipca.transform(x[i:stop]).astype(np.float16).tofile(pca_file)
 
 
 # Encode sentences (file names)
 def EncodeFile(
+    pca_dim,
+    load,
+    checkpoint,
     pool,
     encoder_name,
     encoder,
@@ -348,7 +401,7 @@ def EncodeFile(
     inp_encoding="utf-8",
 ):
     # TODO :handle over write
-    if not os.path.isfile(out_fname):
+    if not os.path.isfile(out_fname) or load != None:
         if verbose:
             print(
                 " - Encoder: {} to {}".format(
@@ -356,13 +409,12 @@ def EncodeFile(
                     os.path.basename(out_fname),
                 )
             )
-        fin = (
-            open(inp_fname, "r", encoding=inp_encoding, errors="surrogateescape")
-            if len(inp_fname) > 0
-            else sys.stdin
-        )
+        fin = open(inp_fname, "r", encoding=inp_encoding, errors="surrogateescape")
         fout = open(out_fname, mode="wb")
         EncodeFilep(
+            pca_dim,
+            load,
+            checkpoint,
             pool,
             encoder_name,
             encoder,
@@ -381,7 +433,7 @@ def EncodeFile(
 def EmbedLoad(fname, start, stop, dim=1024, verbose=False, dtype="fp32"):
     stop = (stop - start) * dim
     start = start * dim
-    print(dim,"dimension")
+    print(dim, "dimension")
     if dtype == "fp16":
         dtype = np.float16
     else:
@@ -400,77 +452,6 @@ def EmbedMmap(fname, dim=1024, dtype=np.float32, verbose=False):
     if verbose:
         print(" - embeddings on disk: {:s} {:d} x {:d}".format(fname, nbex, dim))
     return E
-
-
-def encoder_file(
-    half,
-    ifname,
-    output,
-    encoder_name,
-    token_lang,
-    verbose,
-    bpe_codes,
-    max_sentences=None,
-    max_tokens=12000,
-    cpu=False,
-    stable=True,
-    encode_batch_size=45000,
-    buffer_size=40000,
-):
-    encoder = None
-    pool = None
-    if encoder_name == "laser":
-        path = str(os.path.join(LASER, "models", "bilstm.93langs.2018-12-26.pt"))
-        encoder = SentenceEncoder(
-            path,
-            max_sentences=max_sentences,
-            max_tokens=max_tokens,
-            sort_kind="mergesort" if stable else "quicksort",
-            cpu=cpu,
-            fp16=half,
-        )
-    if encoder_name == "labse":
-        encoder = SentenceTransformer("LaBSE")
-        if half:
-            encoder.half()
-        encoder.eval()
-        pool = encoder.start_multi_process_pool(encode_batch_size=encode_batch_size)
-    with tempfile.TemporaryDirectory() as tmpdir:
-        ifname = ""  # stdin will be used
-        if token_lang != "--" and encoder_name == "laser":
-            tok_fname = os.path.join(tmpdir, "tok")
-            Token(
-                ifname,
-                tok_fname,
-                lang=token_lang,
-                romanize=True if token_lang == "el" else False,
-                lower_case=True,
-                gzip=False,
-                verbose=verbose,
-                over_write=False,
-            )
-
-            ifname = tok_fname
-        if bpe_codes:
-            bpe_fname = os.path.join(tmpdir, "bpe")
-            BPEfastApply(
-                ifname,
-                bpe_fname,
-                bpe_codes,
-                verbose=verbose,
-                over_write=False,
-            )
-            ifname = bpe_fname
-        EncodeFile(
-            pool,
-            encoder_name,
-            encoder,
-            ifname,
-            output,
-            verbose=verbose,
-            over_write=False,
-            buffer_size=buffer_size,
-        )
 
 
 if __name__ == "__main__":
@@ -496,6 +477,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-o", "--output", required=True, help="Output sentence embeddings"
     )
+    parser.add_argument("-i", "--input", required=True, help="Input File name")
     parser.add_argument(
         "--buffer-size", type=int, default=40000, help="Buffer size (sentences)"
     )
@@ -517,6 +499,12 @@ if __name__ == "__main__":
         help="Maximum number of sentences to process in a batch",
     )
     parser.add_argument("--cpu", action="store_true", help="Use CPU instead of GPU")
+    parser.add_argument("--load", type=str, help="To load from chekcpoint")
+    parser.add_argument(
+        "--checkpoint", type=str, help="Checkpoint file name", default="checkpoint.json"
+    )
+    parser.add_argument("--pca-dim", type=int, help="Reduced dimention of input")
+
     parser.add_argument(
         "--stable",
         action="store_true",
@@ -553,9 +541,10 @@ if __name__ == "__main__":
         pool = encoder.start_multi_process_pool(
             encode_batch_size=args.encode_batch_size
         )
+    print(encoder.parameters)
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        ifname = ""  # stdin will be used
+        ifname = args.input  # stdin will be used
         if args.token_lang != "--" and args.encoder == "laser":
             tok_fname = os.path.join(tmpdir, "tok")
             Token(
@@ -581,6 +570,9 @@ if __name__ == "__main__":
             )
             ifname = bpe_fname
         EncodeFile(
+            args.pca_dim,
+            args.load,
+            args.checkpoint,
             pool,
             args.encoder,
             encoder,

@@ -25,6 +25,9 @@ from tqdm import tqdm
 from psutil import virtual_memory
 import time
 
+
+from sklearn.decomposition import PCA
+
 # get environment
 assert os.environ.get("LASER"), "Please set the enviornment variable LASER"
 LASER = os.environ["LASER"]
@@ -103,30 +106,35 @@ def knnGPU(
 ):
     x = x.astype("float32")
     y = y.astype("float32")
-    d = y.shape[1]
+    d = 128
     # index2 = faiss.index_factory(dim, index_factory)
     # index2 = faiss.index_cpu_to_all_gpus(index2)
+    n_cluster = min(32768, int(y.shape[0] / 1000))
 
-    index2 = faiss.IndexFlatL2(d)  # this remains the same
-    index2 = faiss.IndexIVFPQ(index2, d, 32768, 8, 8)
+    index2 = faiss.IndexFlatIP(d)
+    # this remains the same
+    index2 = faiss.IndexIVFFlat(
+        index2, y.shape[1], n_cluster, faiss.METRIC_INNER_PRODUCT
+    )
+
     index2 = faiss.index_cpu_to_all_gpus(index2)
 
-    name = "./" + index_factory + "/" + index_name
-    if not os.path.exists(name):
-        if not os.path.exists("./" + index_factory):
-            os.mkdir("./" + index_factory)
-        index2.train(y)
-        temp = faiss.index_gpu_to_cpu(index2)
-        faiss.write_index(temp, name)
-        print("Index {name} got saved".format(name="index_name"))
+    # name = "./" + index_factory + "/" + index_name
+    # if not os.path.exists(name):
+    #    if not os.path.exists("./" + index_factory):
+    #        os.mkdir("./" + index_factory)
+    #    index2.train(y)
+    #    temp = faiss.index_gpu_to_cpu(index2)
+    #    faiss.write_index(temp, name)
+    #    print("Index {name} got saved".format(name="index_name"))
 
-    else:
-        index2 = faiss.read_index(name)
-        index2 = faiss.index_cpu_to_all_gpus(index2)
+    # else:
+    #    index2 = faiss.read_index(name)
+    index2.train(y)
     index2.add(y)
-    index2.nprobe = 10
+    index2.nprobe = 5
     sim, ind = index2.search(x, k)
-
+    del index2
     return sim, ind
 
 
@@ -205,10 +213,11 @@ def mine_text(
     )
     if args.unify:
         x = unique_embeddings(x, src_inds, args.verbose)
-    if args.encoder == "laser":
-        faiss.normalize_L2(x)
+
+    # faiss.normalize_L2(x)
 
     # load y
+    print(x.shape)
     y = EmbedLoad(
         args.trg_embeddings,
         trg_start,
@@ -217,11 +226,12 @@ def mine_text(
         verbose=args.verbose,
         dtype=args.dtype,
     )
+    print(y.shape)
 
     if args.unify:
         y = unique_embeddings(y, trg_inds, args.verbose)
-    if args.encoder == "laser":
-        faiss.normalize_L2(y)
+
+    # faiss.normalize_L2(y)
 
     if args.retrieval is not "bwd":
         if args.verbose:
@@ -265,76 +275,45 @@ def mine_text(
         + str(trg_stop)
     )
     fout = open(name, mode="w", encoding=args.encoding, errors="surrogateescape")
-    if args.mode == "mine":
-        if args.verbose:
-            print(" - mining for parallel data")
-        fwd_scores = None
-        fwd_scores = None
-        if args.cosine_sim:
-            print("cosine sim")
-            fwd_scores = score_candidates(
-                x, y, x2y_ind, x2y_mean, y2x_mean, margin, args.verbose
-            )
-            bwd_scores = score_candidates(
-                y, x, y2x_ind, y2x_mean, x2y_mean, margin, args.verbose
-            )
-        elif args.encoder == "labse":
-            print("labse")
-            fwd_scores = x2y_sim
-            bwd_scores = y2x_sim
-        fwd_best = x2y_ind[np.arange(x.shape[0]), fwd_scores.argmax(axis=1)]
-        bwd_best = y2x_ind[np.arange(y.shape[0]), bwd_scores.argmax(axis=1)]
+    if args.verbose:
+        print(" - mining for parallel data")
+    fwd_scores = score_candidates(
+        x, y, x2y_ind, x2y_mean, y2x_mean, margin, args.verbose
+    )
+    bwd_scores = score_candidates(
+        y, x, y2x_ind, y2x_mean, x2y_mean, margin, args.verbose
+    )
+    fwd_best = x2y_ind[np.arange(x.shape[0]), fwd_scores.argmax(axis=1)]
+    bwd_best = y2x_ind[np.arange(y.shape[0]), bwd_scores.argmax(axis=1)]
 
-        if args.verbose:
-            print(" - writing alignments to {:s}".format(args.output))
-            if args.threshold > 0:
-                print(" - with threshold of {:f}".format(args.threshold))
-        if args.retrieval == "fwd":
-            for i, j in enumerate(fwd_best):
+    if args.verbose:
+        print(" - writing alignments to {:s}".format(args.output))
+        if args.threshold > 0:
+            print(" - with threshold of {:f}".format(args.threshold))
+    indices = np.stack(
+        (
+            np.concatenate((np.arange(x.shape[0]), bwd_best)),
+            np.concatenate((fwd_best, np.arange(y.shape[0]))),
+        ),
+        axis=1,
+    )
+    scores = np.concatenate((fwd_scores.max(axis=1), bwd_scores.max(axis=1)))
+    seen_src, seen_trg = set(), set()
+    for i in np.argsort(-scores):
+        src_ind, trg_ind = indices[i]
+        if not src_ind in seen_src and not trg_ind in seen_trg:
+            seen_src.add(src_ind)
+            seen_trg.add(trg_ind)
+            if scores[i] >= args.threshold:
                 print(
-                    fwd_scores[i].max(), src_sents[i], trg_sents[j], sep="\t", file=fout
+                    scores[i],
+                    src_sents[src_ind],
+                    trg_sents[trg_ind],
+                    sep="\t",
+                    file=fout,
                 )
-        if args.retrieval == "bwd":
-            for j, i in enumerate(bwd_best):
-                print(
-                    bwd_scores[j].max(), src_sents[i], trg_sents[j], sep="\t", file=fout
-                )
-        if args.retrieval == "intersect":
-            for i, j in enumerate(fwd_best):
-                if bwd_best[j] == i:
-                    print(
-                        fwd_scores[i].max(),
-                        src_sents[i],
-                        trg_sents[j],
-                        sep="\t",
-                        file=fout,
-                    )
-        if args.retrieval == "max":
-            indices = np.stack(
-                (
-                    np.concatenate((np.arange(x.shape[0]), bwd_best)),
-                    np.concatenate((fwd_best, np.arange(y.shape[0]))),
-                ),
-                axis=1,
-            )
-            scores = np.concatenate((fwd_scores.max(axis=1), bwd_scores.max(axis=1)))
-            seen_src, seen_trg = set(), set()
-            print(scores.shape)
-            for i in np.argsort(-scores):
-                src_ind, trg_ind = indices[i]
-                if not src_ind in seen_src and not trg_ind in seen_trg:
-                    seen_src.add(src_ind)
-                    seen_trg.add(trg_ind)
-                    if scores[i] >= args.threshold:
-                        print(
-                            scores[i],
-                            src_sents[src_ind],
-                            trg_sents[trg_ind],
-                            sep="\t",
-                            file=fout,
-                        )
-                    if src_ind == trg_ind:
-                        count += 1
+            if src_ind == trg_ind:
+                count += 1
 
     fout.close()
     return src_file_pos, trg_file_pos, count
@@ -369,12 +348,7 @@ if __name__ == "__main__":
     )
 
     # mining params
-    parser.add_argument(
-        "--mode",
-        choices=["search", "score", "mine"],
-        required=True,
-        help="Execution mode",
-    )
+
     parser.add_argument(
         "-k", "--neighborhood", type=int, default=4, help="Neighborhood size"
     )
@@ -422,10 +396,10 @@ if __name__ == "__main__":
         help="size of data to be loaded at a time",
     )
     parser.add_argument(
-        "--src_lines", nargs="+",type=int, help="start,stop lines for source file"
+        "--src_lines", nargs="+", type=int, help="start,stop lines for source file"
     )
     parser.add_argument(
-        "--trg_lines", nargs="+",type=int, help="start,stop lines for target file"
+        "--trg_lines", nargs="+", type=int, help="start,stop lines for target file"
     )
 
     args = parser.parse_args()
