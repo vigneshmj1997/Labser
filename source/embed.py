@@ -372,8 +372,6 @@ def EncodeFilep(
         if encoder_name == "laser":
             encoder.encoder.add_module("dense", dense)
 
-    pool = encoder.start_multi_process_pool(encode_batch_size=encode_batch_size)
-
     for sentences, pointer in tqdm(buffered_read(inp_file, buffer_size, load)):
         temp = None
         if encoder_name == "laser":
