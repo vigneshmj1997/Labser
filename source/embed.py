@@ -45,7 +45,7 @@ SPACE_NORMALIZER = re.compile("\s+")
 Batch = namedtuple("Batch", "srcs tokens lengths")
 
 
-def buffered_read(fp, buffer_size, load):
+def buffered_read(fp, buffer_size, load, reset=False):
     buffer = []
     n = 0
     if load != None:
@@ -53,6 +53,8 @@ def buffered_read(fp, buffer_size, load):
             data = json.load(f)
             fp.seek(data["embed_position"])
             n = int(data["embed_position"])
+    if reset:
+        fp.seek(0)
     for src_str in fp:
         buffer.append(src_str.strip())
         n += len(src_str)
@@ -337,23 +339,29 @@ def EncodeFilep(
     n = 0
     t = time.time()
     ipca = None
-    pool = encoder.start_multi_process_pool(encode_batch_size=encode_batch_size)
 
     if pca_dim != None:
+        pool = encoder.start_multi_process_pool(encode_batch_size=encode_batch_size)
+
         pca = PCA(n_components=pca_dim)
         if verbose:
             print("Implementing pca with dim", args.pca_dim)
-        sentence, position = next(iter(buffered_read(inp_file, buffer_size, load)))
-        if encoder_name == "labse":
-            if torch.cuda.device_count() > 1:
-                temp = np.array(
-                    encoder.encode_multi_process(sentences=sentence, pool=pool)
-                )
-            else:
-                temp = np.array(encoder.encode(sentences=sentence))
+        total = np.array([])
+        for sentences, pointer in tqdm(
+            buffered_read(inp_file, buffer_size, load, reset=True)
+        ):
+            if encoder_name == "labse":
+                if torch.cuda.device_count() > 1:
+                    temp = np.array(
+                        encoder.encode_multi_process(sentences=sentences, pool=pool)
+                    )
+                else:
+                    temp = np.array(encoder.encode(sentences=sentences))
+            total = np.concatenate((total, temp), axis=0)
         if encoder_name == "laser":
             temp = encoder.encode(sentence)
-        pca.fit(temp)
+        pca.fit(total)
+        print("total shape", total.shape)
         if verbose:
             print(
                 "Total information retentivity is ", sum(pca.explained_variance_ratio_)
@@ -371,8 +379,12 @@ def EncodeFilep(
 
         if encoder_name == "laser":
             encoder.encoder.add_module("dense", dense)
+        encoder.stop_multi_process_pool(pool)
+    pool = encoder.start_multi_process_pool(encode_batch_size=encode_batch_size)
 
-    for sentences, pointer in tqdm(buffered_read(inp_file, buffer_size, load)):
+    for sentences, pointer in tqdm(
+        buffered_read(inp_file, buffer_size, load, reset=True)
+    ):
         temp = None
         if encoder_name == "laser":
             temp = encoder.encode(sentences)

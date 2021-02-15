@@ -36,7 +36,7 @@ sys.path.append(LASER + "/source")
 sys.path.append(LASER + "/source/tools")
 from embed import SentenceEncoder, EncodeLoad, EncodeFile, EmbedLoad
 from text_processing import Token, BPEfastApply
-
+import torch
 
 ###############################################################################
 #
@@ -86,13 +86,127 @@ def TextLoadUnify(fname, seek, args, start, stop):
 #
 ###############################################################################
 
+gpu_resources = []
+ngpu = torch.cuda.device_count()
+for i in range(torch.cuda.device_count()):
+    res = faiss.StandardGpuResources()
+    res.setTempMemory(8 * 1024 * 1024 * 1024)
+    gpu_resources.append(res)
 
-def knn(x, y, k, use_gpu, dim, name, index_factory):
-    return (
-        knnGPU(x, y, k, dim, index_name=name, index_factory=index_factory)
-        if use_gpu
-        else knnCPU(x, y, k)
-    )
+
+def make_vres_vdev(i0=0, i1=-1):
+    " return vectors of device ids and resources useful for gpu_multiple"
+    vres = faiss.GpuResourcesVector()
+    vdev = faiss.IntVector()
+    if i1 == -1:
+        i1 = ngpu
+    for i in range(i0, i1):
+        vdev.push_back(i)
+        vres.push_back(gpu_resources[i])
+    return vres, vdev
+
+
+def create_index(
+    numpy_filename,
+    encoder_name,
+    dim=768,
+    dtype="fp16",
+    batch_size=5000000,
+    out_file="indexfile",
+):
+    if dtype == "fp16":
+        denomenator = 2
+    elif dtype == "fp32":
+        denomenator = 4
+
+    file_size = int(os.stat(numpy_filename).st_size / (args.dim * denomenator))
+    coarse_quantizer = faiss.IndexFlatIP(dim)
+    indexall = faiss.IndexIVFFlat(coarse_quantizer, dim, 32768, faiss.METRIC_L2)
+    co = faiss.GpuMultipleClonerOptions()
+    co.useFloat16 = True
+    co.useFloat16CoarseQuantizer = False
+    co.usePrecomputed = True
+    co.indicesOptions = faiss.INDICES_CPU
+    co.verbose = True
+    co.reserveVecs = file_size
+    co.shard = True
+    assert co.shard_type in (0, 1, 2)
+    vres, vdev = make_vres_vdev()
+    gpu_index = faiss.index_cpu_to_gpu_multiple(vres, vdev, indexall, co)
+    max_add = file_size
+    print("add...")
+    print(gpu_index)
+
+    t0 = time.time()
+    batch_size = min(batch_size, file_size)
+    print(batch_size, "batch_size")
+    for i0 in tqdm(range(0, file_size, batch_size)):
+        i1 = min(i0 + batch_size, file_size)
+        print(i1, "i1")
+
+        xs = EmbedLoad(
+            numpy_filename,
+            i0,
+            i1,
+            dim=1024 if encoder_name == "laser" else 768,
+            dtype=dtype,
+        )
+        print(gpu_index)
+        xs = xs.astype(np.float32)
+        # gpu_index.train(xs)
+        # gpu_index.add(xs)
+        print(xs.shape)
+        print(np.arange(i0, i1).shape)
+        print(gpu_index.ntotal, "gpuindex")
+        print(max_add, "max_add")
+        indexall.train(xs)
+        print(gpu_index.is_trained, "gpu_index is trained")
+        gpu_index.add_with_ids(xs, np.arange(i0, i1))
+        if max_add > 0 and gpu_index.ntotal > max_add:
+            print("Flush indexes to CPU")
+            for i in range(ngpu):
+                index_src_gpu = faiss.downcast_index(gpu_index.at(i))
+                index_src = faiss.index_gpu_to_cpu(index_src_gpu)
+                print("  index %d size %d" % (i, index_src.ntotal))
+                index_src.copy_subset_to(indexall, 0, 0, dim)
+                index_src_gpu.reset()
+                index_src_gpu.reserveMemory(max_add)
+            gpu_index.sync_with_shard_indexes()
+
+        sys.stdout.flush()
+    print("Add time: %.3f s" % (time.time() - t0))
+
+    print("Aggregate indexes to CPU")
+    t0 = time.time()
+
+    if hasattr(gpu_index, "at"):
+        # it is a sharded index
+        for i in range(ngpu):
+            index_src = faiss.index_gpu_to_cpu(gpu_index.at(i))
+            print("  index %d size %d" % (i, index_src.ntotal))
+            index_src.copy_subset_to(indexall, 0, 0, dim)
+    else:
+        # simple index
+        index_src = faiss.index_gpu_to_cpu(gpu_index)
+        index_src.copy_subset_to(indexall, 0, 0, dim)
+
+    print("  done in %.3f s" % (time.time() - t0))
+
+    if max_add > 0:
+        # it does not contain all the vectors
+        gpu_index = None
+    file = open(out_file, "wb")
+    print(gpu_index, "gpu__index")
+    print(indexall, "indexall")
+    print(indexall.is_trained, "is trained")
+    print(indexall.ntotal, "ntotal indexall")
+
+    faiss.write_index(indexall, out_file)
+    return gpu_index, indexall
+
+
+def knn(x, y, k, use_gpu, dim, index):
+    return knnGPU(x, y, k, dim, index) if use_gpu else knnCPU(x, y, k)
 
     ###############################################################################
     #
@@ -101,40 +215,25 @@ def knn(x, y, k, use_gpu, dim, name, index_factory):
     ###############################################################################
 
 
-def knnGPU(
-    x, y, k, dim, index_name="index", index_factory="Flat", mem=5 * 1024 * 1024 * 1024
-):
+def knnGPU(x, y, k, dim, index):
     x = x.astype("float32")
-    y = y.astype("float32")
-    d = 128
-    # index2 = faiss.index_factory(dim, index_factory)
-    # index2 = faiss.index_cpu_to_all_gpus(index2)
-    n_cluster = min(32768, int(y.shape[0] / 1000))
-
-    index2 = faiss.IndexFlatIP(d)
-    # this remains the same
-    index2 = faiss.IndexIVFFlat(
-        index2, y.shape[1], n_cluster, faiss.METRIC_INNER_PRODUCT
-    )
-
-    index2 = faiss.index_cpu_to_all_gpus(index2)
-
-    # name = "./" + index_factory + "/" + index_name
-    # if not os.path.exists(name):
-    #    if not os.path.exists("./" + index_factory):
-    #        os.mkdir("./" + index_factory)
-    #    index2.train(y)
-    #    temp = faiss.index_gpu_to_cpu(index2)
-    #    faiss.write_index(temp, name)
-    #    print("Index {name} got saved".format(name="index_name"))
-
-    # else:
-    #    index2 = faiss.read_index(name)
-    index2.train(y)
-    index2.add(y)
-    index2.nprobe = 5
-    sim, ind = index2.search(x, k)
-    del index2
+    d = x.shape[1]
+    co = faiss.GpuMultipleClonerOptions()
+    co.useFloat16 = True
+    co.useFloat16CoarseQuantizer = False
+    co.usePrecomputed = False
+    co.indicesOptions = 0
+    co.verbose = True
+    co.shard = True  # the replicas will be made "manually"
+    t0 = time.time()
+    vres, vdev = make_vres_vdev()
+    index = faiss.index_cpu_to_gpu_multiple(vres, vdev, index, co)
+    ps = faiss.GpuParameterSpace()
+    ps.initialize(index)
+    ps.set_index_parameter(index, "nprobe", k)
+    index.add(y)
+    sim, ind = index.search(x, k)
+    del index
     return sim, ind
 
 
@@ -181,7 +280,16 @@ def score_candidates(x, y, candidate_inds, fwd_mean, bwd_mean, margin, verbose=F
 #
 ###############################################################################
 def mine_text(
-    src_start, src_stop, trg_start, trg_stop, args, src_file_pos, trg_file_pos, count
+    src_start,
+    src_stop,
+    trg_start,
+    trg_stop,
+    args,
+    src_file_pos,
+    trg_file_pos,
+    count,
+    src_index,
+    trg_index,
 ):
 
     # Load text
@@ -203,6 +311,7 @@ def mine_text(
 
     # load Embeddings
     # load x
+    pca_value = PCA(n_components=args.pca_dim)
     x = EmbedLoad(
         args.src_embeddings,
         src_start,
@@ -227,41 +336,23 @@ def mine_text(
         dtype=args.dtype,
     )
     print(y.shape)
-
+    # pca_value.fit(np.concatenate((x, y), axis=0))
+    # x = pca_value.transform(x)
+    # y = pca_value.transform(y)
     if args.unify:
         y = unique_embeddings(y, trg_inds, args.verbose)
 
     # faiss.normalize_L2(y)
 
-    if args.retrieval is not "bwd":
-        if args.verbose:
-            print(" - perform {:d}-nn source against target".format(args.neighborhood))
-        name = "bwd" + str(trg_start) + "-" + str(trg_stop)
-        x2y_sim, x2y_ind = knn(
-            x,
-            y,
-            min(y.shape[0], args.neighborhood),
-            args.gpu,
-            args.dim,
-            name,
-            args.index_factory,
-        )
-        x2y_mean = x2y_sim.mean(axis=1)
+    x2y_sim, x2y_ind = knn(
+        x, y, min(y.shape[0], args.neighborhood), args.gpu, args.dim, trg_index
+    )
+    x2y_mean = x2y_sim.mean(axis=1)
 
-    if args.retrieval is not "fwd":
-        if args.verbose:
-            print(" - perform {:d}-nn target against source".format(args.neighborhood))
-        name = "fwd" + str(src_start) + "-" + str(src_stop)
-        y2x_sim, y2x_ind = knn(
-            y,
-            x,
-            min(x.shape[0], args.neighborhood),
-            args.gpu,
-            args.dim,
-            name,
-            args.index_factory,
-        )
-        y2x_mean = y2x_sim.mean(axis=1)
+    y2x_sim, y2x_ind = knn(
+        y, x, min(x.shape[0], args.neighborhood), args.gpu, args.dim, src_index
+    )
+    y2x_mean = y2x_sim.mean(axis=1)
 
     margin = lambda a, b: a / b
     name = (
@@ -374,9 +465,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--gpu", action="store_true", help="Run knn on all available GPUs"
     )
-    parser.add_argument(
-        "--cosine-sim", action="store_true", help="To use cosine similarity"
-    )
+    parser.add_argument("--pca-dim", type=int, help="PCA value")
     parser.add_argument("--verbose", action="store_true", help="Detailed output")
 
     # embeddings
@@ -421,7 +510,9 @@ if __name__ == "__main__":
 
     size_src = int(os.stat(args.src_embeddings).st_size / (args.dim * denomenator))
     size_trg = int(os.stat(args.trg_embeddings).st_size / (args.dim * denomenator))
-
+    print(size_src)
+    print(size_trg)
+    print("$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$")
     if args.src_lines != None:
         src_start = args.src_lines[0]
         trg_start = args.trg_lines[0]
@@ -437,6 +528,16 @@ if __name__ == "__main__":
     # According to the US Census Bureau, by 2010, the District's population declined to 20,876 people.
     tot = 0
     print(chunk_lines, "chunk_lines")
+    if args.verbose:
+        print("Creating index for src")
+    src_gpu_index, src_index = create_index(
+        args.src_embeddings, "labse", out_file="index_src"
+    )
+    if args.verbose:
+        print("Creating index for trg")
+    trg_gpu_index, trg_index = create_index(
+        args.trg_embeddings, "labse", out_file="index_trg"
+    )
     for i in tqdm(range(src_start, src_stop, chunk_lines)):
         for j in range(trg_start, trg_stop, chunk_lines):
 
@@ -444,7 +545,16 @@ if __name__ == "__main__":
             trg_stop = min(j + chunk_lines, size_trg)
             start = time.time()
             src_pos, trg_pos, count = mine_text(
-                i, src_stop, j, trg_stop, args, src_pos, trg_pos, tot
+                i,
+                src_stop,
+                j,
+                trg_stop,
+                args,
+                src_pos,
+                trg_pos,
+                tot,
+                src_index,
+                trg_index,
             )
             stop = time.time()
             print("Total time is per itertation is ", start - stop)
